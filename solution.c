@@ -103,7 +103,13 @@ PackageInfo allPackages[MAX_TOTAL_PACKAGES];
 
 // list of packageIds that are currently unassigned
 int unassignedIds[MAX_TOTAL_PACKAGES];
+int unassignedHead = 0;
+int unassignedTail = 0;
 int unassignedCount = 0;
+
+// list of packageIds that are currently active (waiting or on trucks)
+int activePackageIds[MAX_TOTAL_PACKAGES];
+int activePackageCount = 0;
 
 
 typedef struct {
@@ -134,6 +140,45 @@ static char helperAuthStrings[MAX_TRUCKS][TRUCK_MAX_CAP + 1];
 static const char AUTH_LETTERS[AUTH_STRING_UNIQUE_LETTERS] = {'u', 'd', 'l', 'r'};
 
 
+static inline void reset_unassigned_queue(void) {
+    unassignedHead = 0;
+    unassignedTail = 0;
+    unassignedCount = 0;
+}
+
+static inline int unassigned_queue_push(int pkgId) {
+    if (unassignedCount >= MAX_TOTAL_PACKAGES) {
+        return 0;
+    }
+    unassignedIds[unassignedTail] = pkgId;
+    unassignedTail = (unassignedTail + 1) % MAX_TOTAL_PACKAGES;
+    unassignedCount++;
+    return 1;
+}
+
+static inline int unassigned_queue_pop(int *pkgId) {
+    if (unassignedCount == 0) {
+        return 0;
+    }
+    *pkgId = unassignedIds[unassignedHead];
+    unassignedHead = (unassignedHead + 1) % MAX_TOTAL_PACKAGES;
+    unassignedCount--;
+    return 1;
+}
+
+static inline void active_packages_add(int pkgId) {
+    if (activePackageCount < MAX_TOTAL_PACKAGES) {
+        activePackageIds[activePackageCount++] = pkgId;
+    }
+}
+
+static inline void active_packages_remove_at(int index) {
+    if (index < 0 || index >= activePackageCount) return;
+    activePackageCount--;
+    activePackageIds[index] = activePackageIds[activePackageCount];
+}
+
+
 //Helper Functions 
 
 void readTruckInfo(MainSharedMemory *shm,
@@ -157,7 +202,10 @@ void readTruckInfo(MainSharedMemory *shm,
         }
     }
 
-    for (int pid = 0; pid < MAX_TOTAL_PACKAGES; pid++) {
+    for (int idx = 0; idx < activePackageCount; idx++) {
+        int pid = activePackageIds[idx];
+        if (pid < 0 || pid >= MAX_TOTAL_PACKAGES) continue;
+
         PackageInfo *info = &allPackages[pid];
         if (!info->used) continue;
         if (info->state == PKG_STATE_DELIVERED) continue;
@@ -172,9 +220,9 @@ void readTruckInfo(MainSharedMemory *shm,
                 truck->currentPackageCount++;
             }
         } else if (info->state == PKG_STATE_WAITING) {
-            int idx = truck->assignedCount;
-            if (idx < TRUCK_MAX_CAP) {
-                truck->assignedPackageIds[idx] = pid;
+            int slot = truck->assignedCount;
+            if (slot < TRUCK_MAX_CAP) {
+                truck->assignedPackageIds[slot] = pid;
                 truck->assignedCount++;
             }
         }
@@ -327,9 +375,19 @@ static int send_solver_guess(int solverMqId, int truckId, const char *guess) {
 }
 
 void updatePackageStatesFromSharedMemory(MainSharedMemory *shm) {
-    for (int pid = 0; pid < MAX_TOTAL_PACKAGES; pid++) {
+    int idx = 0;
+    while (idx < activePackageCount) {
+        int pid = activePackageIds[idx];
+        if (pid < 0 || pid >= MAX_TOTAL_PACKAGES) {
+            active_packages_remove_at(idx);
+            continue;
+        }
+
         PackageInfo *info = &allPackages[pid];
-        if (!info->used) continue;
+        if (!info->used) {
+            active_packages_remove_at(idx);
+            continue;
+        }
 
         int px = shm->packageLocations[pid][0];
         int py = shm->packageLocations[pid][1];
@@ -351,36 +409,54 @@ void updatePackageStatesFromSharedMemory(MainSharedMemory *shm) {
                 info->state = PKG_STATE_WAITING;
             }
         }
+
+        if (info->state == PKG_STATE_DELIVERED || info->state == PKG_STATE_UNUSED) {
+            active_packages_remove_at(idx);
+            continue;
+        }
+
+        idx++;
     }
 }
 
 
-void compute_truck_dropoff_centroid(const TruckInfo *t, double *cx, double *cy) {
-    double sumX = 0.0, sumY = 0.0;
-    int count = 0;
+static void compute_truck_target_stats(const TruckInfo *t,
+                                       double *sumX,
+                                       double *sumY,
+                                       int *count) {
+    double localSumX = 0.0;
+    double localSumY = 0.0;
+    int localCount = 0;
 
-    // onboard packages: use dropoffs
     for (int i = 0; i < t->currentPackageCount; i++) {
         int pid = t->packageIds[i];
         if (pid < 0) continue;
         PackageRequest *p = &allPackages[pid].pkg;
-        sumX += p->dropoff_x;
-        sumY += p->dropoff_y;
-        count++;
+        localSumX += p->dropoff_x;
+        localSumY += p->dropoff_y;
+        localCount++;
     }
 
-    // assigned but not yet picked
     for (int i = 0; i < t->assignedCount; i++) {
         int pid = t->assignedPackageIds[i];
         if (pid < 0) continue;
         PackageRequest *p = &allPackages[pid].pkg;
-        sumX += p->dropoff_x;
-        sumY += p->dropoff_y;
-        count++;
+        localSumX += p->dropoff_x;
+        localSumY += p->dropoff_y;
+        localCount++;
     }
 
+    if (sumX) *sumX = localSumX;
+    if (sumY) *sumY = localSumY;
+    if (count) *count = localCount;
+}
+
+void compute_truck_dropoff_centroid(const TruckInfo *t, double *cx, double *cy) {
+    double sumX = 0.0, sumY = 0.0;
+    int count = 0;
+    compute_truck_target_stats(t, &sumX, &sumY, &count);
+
     if (count == 0) {
-        // no targets yet: use current truck position
         *cx = (double)t->x;
         *cy = (double)t->y;
     } else {
@@ -445,16 +521,36 @@ void assignPackagesToTrucks(TruckInfo trucks[], int D) {
     printf("=== Assignment batch: taking up to %d packages (unassignedCount=%d) ===\n",
            batch, unassignedCount);
 
+    typedef struct {
+        int routeLen;
+        int lastX;
+        int lastY;
+        int plannedLoad;
+        double centroidSumX;
+        double centroidSumY;
+        int centroidCount;
+    } TruckPlanningState;
+
+    TruckPlanningState planning[MAX_TRUCKS];
+    for (int t = 0; t < D; t++) {
+        TruckPlanningState *state = &planning[t];
+        state->plannedLoad = trucks[t].currentPackageCount + trucks[t].assignedCount;
+        state->routeLen = compute_truck_route_length(&trucks[t], &state->lastX, &state->lastY);
+
+        double sumX = 0.0, sumY = 0.0;
+        int count = 0;
+        compute_truck_target_stats(&trucks[t], &sumX, &sumY, &count);
+        state->centroidSumX = sumX;
+        state->centroidSumY = sumY;
+        state->centroidCount = count;
+    }
+
 
     for (int b = 0; b < batch; b++) {
-        if (unassignedCount == 0) break;
-
-        // Pop from front of queue
-        int pkgId = unassignedIds[0];
-        for (int i = 1; i < unassignedCount; i++) {
-            unassignedIds[i - 1] = unassignedIds[i];
+        int pkgId = -1;
+        if (!unassigned_queue_pop(&pkgId)) {
+            break;
         }
-        unassignedCount--;
 
         PackageInfo *info = &allPackages[pkgId];
         if (!info->used) {
@@ -484,10 +580,10 @@ void assignPackagesToTrucks(TruckInfo trucks[], int D) {
         // Try all trucks
         for (int t = 0; t < D; t++) {
             TruckInfo *truck = &trucks[t];
+            TruckPlanningState *state = &planning[t];
 
             // Capacity check (onboard + already assigned)
-            int plannedLoad = truck->currentPackageCount + truck->assignedCount;
-            if (plannedLoad >= MAX_CAPACITY) {
+            if (state->plannedLoad >= MAX_CAPACITY) {
                 // Debug
                 // printf("  Truck %d: capacity limit reached (%d)\n", t, plannedLoad);
                 continue;
@@ -503,8 +599,12 @@ void assignPackagesToTrucks(TruckInfo trucks[], int D) {
             }
 
             // Direction similarity
-            double cx, cy;
-            compute_truck_dropoff_centroid(truck, &cx, &cy);
+            double cx = (state->centroidCount > 0)
+                            ? state->centroidSumX / state->centroidCount
+                            : (double)truck->x;
+            double cy = (state->centroidCount > 0)
+                            ? state->centroidSumY / state->centroidCount
+                            : (double)truck->y;
 
             double truck_vec_x = cx - truck->x;
             double truck_vec_y = cy - truck->y;
@@ -516,17 +616,15 @@ void assignPackagesToTrucks(TruckInfo trucks[], int D) {
                                            pkg_vec_x, pkg_vec_y);
 
             // Route insertion cost: appending pickup+dropoff at end
-            int lastX, lastY;
-            int baseLen = compute_truck_route_length(truck, &lastX, &lastY);
-            int extra = manhattan(lastX, lastY, p->pickup_x, p->pickup_y)
+            int extra = manhattan(state->lastX, state->lastY, p->pickup_x, p->pickup_y)
                         + manhattan(p->pickup_x, p->pickup_y, p->dropoff_x, p->dropoff_y);
             int insertion_cost = extra;
 
             int limit = (sim > 0.7) ? 4 : 2;
 
-          
+
             printf("  Truck %d: dist_to_pickup=%d, sim=%.2f, baseLen=%d, extra=%d, limit=%d\n",
-                   t, dist_to_pickup, sim, baseLen, extra, limit);
+                   t, dist_to_pickup, sim, state->routeLen, extra, limit);
 
             if (insertion_cost <= limit && insertion_cost < bestCost) {
                 bestCost = insertion_cost;
@@ -537,6 +635,7 @@ void assignPackagesToTrucks(TruckInfo trucks[], int D) {
         if (bestTruckIndex != -1) {
             // Assign package to best truck
             TruckInfo *bestTruck = &trucks[bestTruckIndex];
+            TruckPlanningState *state = &planning[bestTruckIndex];
 
             int idx = bestTruck->assignedCount;
             if (idx < TRUCK_MAX_CAP) {
@@ -545,18 +644,30 @@ void assignPackagesToTrucks(TruckInfo trucks[], int D) {
 
                 info->assignedToTruck = bestTruckIndex;
 
-               
+
                 printf("[Assign] Package %d assigned to truck %d (insertion_cost=%d)\n",
                        pkgId, bestTruckIndex, bestCost);
+
+                state->plannedLoad++;
+                state->routeLen += bestCost;
+                state->lastX = p->dropoff_x;
+                state->lastY = p->dropoff_y;
+                state->centroidSumX += p->dropoff_x;
+                state->centroidSumY += p->dropoff_y;
+                state->centroidCount++;
             } else {
                 printf("[Assign] WARNING: truck %d assigned list full, re-queuing package %d\n",
                        bestTruckIndex, pkgId);
-                unassignedIds[unassignedCount++] = pkgId;
+                if (!unassigned_queue_push(pkgId)) {
+                    printf("[Assign] ERROR: unassigned queue overflow when re-queuing %d\n", pkgId);
+                }
             }
         } else {
             // Fallback: could not assign now, push package back to queue tail
             printf("[Assign] No suitable truck found for package %d, re-queued.\n", pkgId);
-            unassignedIds[unassignedCount++] = pkgId;
+            if (!unassigned_queue_push(pkgId)) {
+                printf("[Assign] ERROR: unassigned queue overflow when re-queuing %d\n", pkgId);
+            }
         }
     }
 
@@ -766,7 +877,8 @@ int main() {
         allPackages[i].current_x = -1;
         allPackages[i].current_y = -1;
     }
-    unassignedCount = 0;
+    reset_unassigned_queue();
+    activePackageCount = 0;
 
 
 
@@ -865,14 +977,24 @@ int main() {
             if (id < 0 || id >= MAX_TOTAL_PACKAGES)
                 continue;
 
-            allPackages[id].used = 1;
-            allPackages[id].assignedToTruck = -1;
-            allPackages[id].pkg = p;
-            allPackages[id].state = PKG_STATE_WAITING;
-            allPackages[id].current_x = p.pickup_x;
-            allPackages[id].current_y = p.pickup_y;
+            PackageInfo *info = &allPackages[id];
+            int alreadyActive = info->used &&
+                                 info->state != PKG_STATE_UNUSED &&
+                                 info->state != PKG_STATE_DELIVERED;
 
-            unassignedIds[unassignedCount++] = id;
+            info->used = 1;
+            info->assignedToTruck = -1;
+            info->pkg = p;
+            info->state = PKG_STATE_WAITING;
+            info->current_x = p.pickup_x;
+            info->current_y = p.pickup_y;
+
+            if (!unassigned_queue_push(id)) {
+                printf("[Assign] ERROR: unassigned queue overflow when adding %d\n", id);
+            }
+            if (!alreadyActive) {
+                active_packages_add(id);
+            }
 
             printf("New package %d -> pickup(%d,%d) drop(%d,%d)\n",
                    id, p.pickup_x, p.pickup_y,
