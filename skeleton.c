@@ -530,13 +530,152 @@ void writeDecisionsToShared(int currentTurn)
 // ---- Authorization guessing ----
 // for now: naive loop guessing a fixed dummy string of proper length
 // (we can refine later)
-void setTargetTruckForSolver(int solverId, int truckId);
-void obtainAuthStringForTruck(int truckId, int solverId, int requiredLen);
-void fillAuthStringsForMovingTrucks(int currentTurn);
+void setTargetTruckForSolver(int solverId, int truckId)
+{
+    SolverRequest req;
+    req.mtype = 2;        // specify truck for solver
+    req.truckNumber = truckId;
+    req.authStringGuess[0] = '\0';
+
+    if (msgsnd(solverMqIds[solverId], &req,
+               sizeof(SolverRequest) - sizeof(long), 0) == -1)
+    {
+        fprintf(stderr, "msgsnd setTargetTruck failed: %s\n", strerror(errno));
+    }
+};
+
+void obtainAuthStringForTruck(int truckId, int solverId, int requiredLen)
+{
+    // For now only simple case: length = 1
+    if (requiredLen != 1) {
+        // Fallback: just fill with 'u'
+        mainShmPtr->authStrings[truckId][0] = 'u';
+        mainShmPtr->authStrings[truckId][1] = '\0';
+        return;
+    }
+
+    const char candidates[4] = { 'u', 'd', 'l', 'r' };
+
+    for (int i = 0; i < 4; i++) {
+
+        SolverRequest req;
+        req.mtype = 3;  // guess message
+        req.truckNumber = truckId;
+
+        req.authStringGuess[0] = candidates[i];
+        req.authStringGuess[1] = '\0';
+
+        // send guess
+        if (msgsnd(solverMqIds[solverId], &req,
+                   sizeof(SolverRequest) - sizeof(long), 0) == -1)
+        {
+            fprintf(stderr, "msgsnd guess failed: %s\n", strerror(errno));
+            continue;
+        }
+
+        // wait for solver response
+        SolverResponse resp;
+        if (msgrcv(solverMqIds[solverId], &resp,
+                   sizeof(SolverResponse) - sizeof(long),
+                   4, 0) == -1)
+        {
+            fprintf(stderr, "msgrcv solver response failed: %s\n",
+                    strerror(errno));
+            continue;
+        }
+
+        if (resp.guessIsCorrect == 1) {
+            // correct auth
+            mainShmPtr->authStrings[truckId][0] = candidates[i];
+            mainShmPtr->authStrings[truckId][1] = '\0';
+            return;
+        }
+    }
+
+    // If somehow none succeeded (should not happen)
+    mainShmPtr->authStrings[truckId][0] = 'u';
+    mainShmPtr->authStrings[truckId][1] = '\0';
+};
+
+void fillAuthStringsForMovingTrucks(int currentTurn)
+{
+    (void) currentTurn; // not needed for simple version
+
+    for (int t = 0; t < D; t++) {
+
+        char move = mainShmPtr->truckMovementInstructions[t];
+        if (move == MOVE_STAY) {
+            continue;   // no auth needed
+        }
+
+        int solverId = t % S;
+
+        setTargetTruckForSolver(solverId, t);
+
+        // Since only one package in our current version:
+        int requiredLen = 1;
+
+        obtainAuthStringForTruck(t, solverId, requiredLen);
+    }
+};
 
 // ---- Turn control ----
-int sendTurnReady();
-int mainLoop();
+int sendTurnReady()
+{
+    TurnReadyRequest req;
+    req.mtype = 1;
+
+    if (msgsnd(mainMqId, &req,
+               sizeof(TurnReadyRequest) - sizeof(long), 0) == -1)
+    {
+        fprintf(stderr, "msgsnd TurnReady failed: %s\n", strerror(errno));
+        return 1;
+    }
+
+    return 0;
+};
+int mainLoop()
+{
+    while (1) {
+
+        // Step 1: Announce ready for next turn
+        if (sendTurnReady() != 0) {
+            return 1;
+        }
+
+        // Step 2: Receive turn-change info
+        TurnChangeResponse resp;
+        if (readTurnChange(&resp) != 0) {
+            return 1;
+        }
+
+        int turn = resp.turnNumber;
+
+        // End condition
+        if (resp.finished == 1) {
+            break;
+        }
+
+        // Step 3: Sync truck positions from shared memory
+        syncTruckPositionsFromShared();
+
+        // Step 4: Ingest new packages for this turn
+        if (resp.newPackageRequestCount > 0) {
+            ingestNewPackagesIntoQueue(resp.newPackageRequestCount, turn);
+        }
+
+        // Step 5: Assign packages (nearest-package single-assignment rule)
+        assignPackagesSimple(turn);
+
+        // Step 6: Determine movements + pickup/drop commands
+        writeDecisionsToShared(turn);
+
+        // Step 7: Fill authorization strings for moving trucks
+        fillAuthStringsForMovingTrucks(turn);
+    }
+
+    return 0;
+};
 
 // =========================
 //  REGION 3: MAIN
