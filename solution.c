@@ -7,7 +7,7 @@
 #include <sys/shm.h>
 #include <sys/msg.h>
 #include <unistd.h>
-#include<math.h>
+#include <limits.h>
 
 
 #define MAX_TRUCKS 250
@@ -145,6 +145,27 @@ int manhattan(int x1, int y1, int x2, int y2) {
     return dx + dy;
 }
 
+double sqrt1(double x) {
+    if (x < 0) {
+        return -1;  
+    }
+    if (x == 0 || x == 1) {
+        return x;
+    }
+
+    double guess = x;
+    double epsilon = 1e-7; 
+
+    while (1) {
+        double next = 0.5 * (guess + x / guess);
+
+        if ( (next - guess < epsilon && next - guess > -epsilon) )
+            return next;
+
+        guess = next;
+    }
+}
+
 
 void compute_truck_dropoff_centroid(const TruckInfo *t, double *cx, double *cy) {
     double sumX = 0.0, sumY = 0.0;
@@ -183,8 +204,8 @@ void compute_truck_dropoff_centroid(const TruckInfo *t, double *cx, double *cy) 
 // Compute cosine similarity between two 2D vectors.
 double cosine_similarity(double ax, double ay, double bx, double by) {
     double dot = ax * bx + ay * by;
-    double na = sqrt(ax * ax + ay * ay);
-    double nb = sqrt(bx * bx + by * by);
+    double na = sqrt1(ax * ax + ay * ay);
+    double nb = sqrt1(bx * bx + by * by);
     if (na == 0.0 || nb == 0.0) return 1.0;
     return dot / (na * nb);
 }
@@ -233,9 +254,6 @@ void assignPackagesToTrucks(TruckInfo trucks[], int D) {
 
     int batch = unassignedCount < BATCH_SIZE ? unassignedCount : BATCH_SIZE;
 
-    printf("=== Assignment batch: taking up to %d packages (unassignedCount=%d) ===\n",
-           batch, unassignedCount);
-
 
     for (int b = 0; b < batch; b++) {
         if (unassignedCount == 0) break;
@@ -249,16 +267,18 @@ void assignPackagesToTrucks(TruckInfo trucks[], int D) {
 
         PackageInfo *info = &allPackages[pkgId];
         if (!info->used) {
-            printf("[Assign] Package %d is not marked used, skipping.\n", pkgId);
+            //printf("[Assign] Package %d is not marked used, skipping.\n", pkgId);
             continue;
         }
 
         PackageRequest *p = &info->pkg;
-        printf("[Assign] Considering package %d: pickup=(%d,%d) drop=(%d,%d)\n",
-               pkgId, p->pickup_x, p->pickup_y, p->dropoff_x, p->dropoff_y);
+        int bestTruckStrict = -1;
+        int bestCostStrict = INF;
+        int bestLoadStrict = INF;
 
-        int bestTruckIndex = -1;
-        int bestCost = INF;
+        int bestTruckRelax = -1;
+        int bestDistRelax = INF;
+        int bestLoadRelax = INF;
 
         // Try all trucks
         for (int t = 0; t < D; t++) {
@@ -267,7 +287,6 @@ void assignPackagesToTrucks(TruckInfo trucks[], int D) {
             // Capacity check (onboard + already assigned)
             int plannedLoad = truck->currentPackageCount + truck->assignedCount;
             if (plannedLoad >= MAX_CAPACITY) {
-                // Debug
                 // printf("  Truck %d: capacity limit reached (%d)\n", t, plannedLoad);
                 continue;
             }
@@ -275,9 +294,17 @@ void assignPackagesToTrucks(TruckInfo trucks[], int D) {
             // Distance to pickup
             int dist_to_pickup = manhattan(truck->x, truck->y, p->pickup_x, p->pickup_y);
 
+            if (dist_to_pickup < bestDistRelax ||
+                (dist_to_pickup == bestDistRelax && plannedLoad < bestLoadRelax) ||
+                (dist_to_pickup == bestDistRelax && plannedLoad == bestLoadRelax && t < bestTruckRelax))
+            {
+                bestDistRelax = dist_to_pickup;
+                bestLoadRelax = plannedLoad;
+                bestTruckRelax = t;
+            }
+
             int max_dist = (truck->currentPackageCount > 2) ? 3 : 4;
             if (dist_to_pickup > max_dist) {
-                // printf("  Truck %d: too far to pickup (%d > %d)\n", t, dist_to_pickup, max_dist);
                 continue;
             }
 
@@ -303,50 +330,211 @@ void assignPackagesToTrucks(TruckInfo trucks[], int D) {
 
             int limit = (sim > 0.7) ? 4 : 2;
 
-          
-            printf("  Truck %d: dist_to_pickup=%d, sim=%.2f, baseLen=%d, extra=%d, limit=%d\n",
-                   t, dist_to_pickup, sim, baseLen, extra, limit);
-
-            if (insertion_cost <= limit && insertion_cost < bestCost) {
-                bestCost = insertion_cost;
-                bestTruckIndex = t;
+            // STRICT candidate: must satisfy insertion_cost <= limit
+            if (insertion_cost <= limit) {
+                if (insertion_cost < bestCostStrict ||
+                    (insertion_cost == bestCostStrict && plannedLoad < bestLoadStrict) ||
+                    (insertion_cost == bestCostStrict && plannedLoad == bestLoadStrict && t < bestTruckStrict))
+                {
+                    bestCostStrict = insertion_cost;
+                    bestLoadStrict = plannedLoad;
+                    bestTruckStrict = t;
+                }
             }
         }
 
-        if (bestTruckIndex != -1) {
-            // Assign package to best truck
-            TruckInfo *bestTruck = &trucks[bestTruckIndex];
+        int chosenTruck = -1;
+        int usedRelaxed = 0;
+
+        if (bestTruckStrict != -1) {
+            chosenTruck = bestTruckStrict;
+        } else if (bestTruckRelax != -1) {
+            chosenTruck = bestTruckRelax;
+            usedRelaxed = 1;
+        }
+
+        if (chosenTruck != -1) {
+            TruckInfo *bestTruck = &trucks[chosenTruck];
 
             int idx = bestTruck->assignedCount;
             if (idx < TRUCK_MAX_CAP) {
                 bestTruck->assignedPackageIds[idx] = pkgId;
                 bestTruck->assignedCount++;
 
-                info->assignedToTruck = bestTruckIndex;
+                info->assignedToTruck = chosenTruck;
 
-               
-                printf("[Assign] Package %d assigned to truck %d (insertion_cost=%d)\n",
-                       pkgId, bestTruckIndex, bestCost);
+                if (!usedRelaxed) {
+            
+                } else {
+                    //printf("[Assign] Package %d assigned to truck %d (RELAXED fallback, dist_to_pickup=%d, load=%d)\n",pkgId, chosenTruck, bestDistRelax, bestLoadRelax);
+                }
             } else {
-                printf("[Assign] WARNING: truck %d assigned list full, re-queuing package %d\n",
-                       bestTruckIndex, pkgId);
+                //printf("[Assign] WARNING: truck %d assigned list full, re-queuing package %d\n",chosenTruck, pkgId);
                 unassignedIds[unassignedCount++] = pkgId;
             }
         } else {
-            // Fallback: could not assign now, push package back to queue tail
-            printf("[Assign] No suitable truck found for package %d, re-queued.\n", pkgId);
+            printf("[Assign] No suitable truck found for package %d (even RELAXED), re-queued.\n", pkgId);
             unassignedIds[unassignedCount++] = pkgId;
         }
     }
 
     // Summary debug print
-    printf("=== Assignment batch complete. Unassigned remaining = %d ===\n", unassignedCount);
+    //printf("=== Assignment batch complete. Unassigned remaining = %d ===\n", unassignedCount);
     for (int t = 0; t < D; t++) {
         printf("  Truck %d: onboard=%d, assigned=%d -> [",
                trucks[t].id, trucks[t].currentPackageCount, trucks[t].assignedCount);
         for (int i = 0; i < trucks[t].assignedCount; i++) {
             printf("%d", trucks[t].assignedPackageIds[i]);
             if (i + 1 < trucks[t].assignedCount) printf(", ");
+        }
+        printf("]\n");
+    }
+}
+
+
+void decide_truck_actions(int D,
+                          TruckInfo trucks[],
+                          PackageInfo allPackages[],
+                          char truckMovementInstructions[],
+                          int pickUpCommands[],
+                          int dropOffCommands[])
+{
+    for (int t = 0; t < D; t++) {
+        TruckInfo *truck = &trucks[t];
+
+        char move = 's';          // default: stay in place
+        int doPickup = 0;
+        int doDropoff = 0;
+
+        int tx = truck->x;
+        int ty = truck->y;
+
+        int foundDropHere = 0;
+        for (int i = 0; i < truck->currentPackageCount; i++) {
+            int pkgId = truck->packageIds[i];
+            if (pkgId < 0) continue;
+            if (!allPackages[pkgId].used) continue;
+
+            PackageRequest *p = &allPackages[pkgId].pkg;
+            if (p->dropoff_x == tx && p->dropoff_y == ty) {
+                foundDropHere = 1;
+                break;
+            }
+        }
+
+        if (foundDropHere) {
+            move = 's';
+            doDropoff = 1;
+        } else {
+
+            int foundPickupHere = 0;
+            for (int i = 0; i < truck->assignedCount; i++) {
+                int pkgId = truck->assignedPackageIds[i];
+                if (pkgId < 0) continue;
+                if (!allPackages[pkgId].used) continue;
+
+                PackageRequest *p = &allPackages[pkgId].pkg;
+                if (p->pickup_x == tx && p->pickup_y == ty) {
+                    foundPickupHere = 1;
+                    break;
+                }
+            }
+
+            if (foundPickupHere) {
+                move = 's';
+                doPickup = 1;
+            } else {
+                
+                int bestDist = INT_MAX;
+                int targetX = tx;
+                int targetY = ty;
+                int haveTarget = 0;
+
+                
+                for (int i = 0; i < truck->currentPackageCount; i++) {
+                    int pkgId = truck->packageIds[i];
+                    if (pkgId < 0) continue;
+                    if (!allPackages[pkgId].used) continue;
+
+                    PackageRequest *p = &allPackages[pkgId].pkg;
+                    int dist = manhattan(tx, ty, p->dropoff_x, p->dropoff_y);
+
+                    if (dist < bestDist) {
+                        bestDist = dist;
+                        targetX = p->dropoff_x;
+                        targetY = p->dropoff_y;
+                        haveTarget = 1;
+                    }
+                }
+
+                
+                if (!haveTarget) {
+                    for (int i = 0; i < truck->assignedCount; i++) {
+                        int pkgId = truck->assignedPackageIds[i];
+                        if (pkgId < 0) continue;
+                        if (!allPackages[pkgId].used) continue;
+
+                        PackageRequest *p = &allPackages[pkgId].pkg;
+                        int dist = manhattan(tx, ty, p->pickup_x, p->pickup_y);
+
+                        if (dist < bestDist) {
+                            bestDist = dist;
+                            targetX = p->pickup_x;
+                            targetY = p->pickup_y;
+                            haveTarget = 1;
+                        }
+                    }
+                }
+
+               
+                if (haveTarget && bestDist > 0) {
+                    int dx = targetX - tx;
+                    int dy = targetY - ty;
+
+                    if (dx != 0) {
+                        move = (dx > 0) ? 'r' : 'l';
+                    } else if (dy != 0) {
+                        move = (dy > 0) ? 'd' : 'u';
+                    } else {
+                        move = 's';
+                    }
+                } else {
+                    move = 's';
+                }
+            }
+        }
+
+        // Write out
+        truckMovementInstructions[t] = move;
+        pickUpCommands[t] = doPickup;
+        dropOffCommands[t] = doDropoff;
+    }
+
+    
+    printf("=== Movement Decisions This Turn ===\n");
+    for (int t = 0; t < D; t++) {
+        TruckInfo *truck = &trucks[t];
+
+        printf("Truck %d at (%d,%d): move=%c, pickUp=%d, dropOff=%d\n",
+               truck->id,
+               truck->x, truck->y,
+               truckMovementInstructions[t],
+               pickUpCommands[t],
+               dropOffCommands[t]);
+
+        // Onboard packages
+        printf("   Onboard: [");
+        for (int i = 0; i < truck->currentPackageCount; i++) {
+            printf("%d", truck->packageIds[i]);
+            if (i + 1 < truck->currentPackageCount) printf(", ");
+        }
+        printf("]\n");
+
+        // Assigned packages
+        printf("   Assigned: [");
+        for (int i = 0; i < truck->assignedCount; i++) {
+            printf("%d", truck->assignedPackageIds[i]);
+            if (i + 1 < truck->assignedCount) printf(", ");
         }
         printf("]\n");
     }
@@ -470,6 +658,15 @@ int main() {
     TruckInfo trucks[MAX_TRUCKS];
     readTruckInfo(mainShmPtr, D, trucks);
     assignPackagesToTrucks(trucks, D);
+    
+    
+    decide_truck_actions(D,
+                     trucks,
+                     allPackages,
+                     mainShmPtr->truckMovementInstructions, 
+                     mainShmPtr->pickUpCommands,
+                     mainShmPtr->dropOffCommands);
+
 
 
    }
