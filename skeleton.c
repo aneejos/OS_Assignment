@@ -145,28 +145,277 @@ static PackageQueue unassignedQueue;
 // =========================
 
 // ---- Helpers: queue & init ----
-void initPackageQueue(PackageQueue *q);
-int  isPackageQueueEmpty(PackageQueue *q);
-void enqueuePackage(PackageQueue *q, int pkgIndex);
-int  dequeuePackage(PackageQueue *q);
+void initPackageQueue(PackageQueue *q)
+{
+    q->front = 0;
+    q->rear = -1;
+    q->size = 0;
+};
 
-void initLocalState();
-int  findPackageSlotById(int packageId); // returns index or -1
+int isPackageQueueEmpty(PackageQueue *q)
+{
+    return (q->size == 0);
+};
+
+void enqueuePackage(PackageQueue *q, int pkgIndex)
+{
+    if (q->size >= MAX_TOTAL_PACKAGES) {
+        // queue overflow should never happen in valid test cases
+        return;
+    }
+    q->rear = (q->rear + 1) % MAX_TOTAL_PACKAGES;
+    q->indices[q->rear] = pkgIndex;
+    q->size++;
+};
+
+int dequeuePackage(PackageQueue *q)
+{
+    if (q->size == 0) {
+        return -1;
+    }
+    int val = q->indices[q->front];
+    q->front = (q->front + 1) % MAX_TOTAL_PACKAGES;
+    q->size--;
+    return val;
+};
+
+
+void initLocalState()
+{
+    // --- Initialize unassigned queue ---
+    initPackageQueue(&unassignedQueue);
+
+    // --- Clear all package slots ---
+    for (int i = 0; i < MAX_TOTAL_PACKAGES; i++) {
+        packages[i].packageId = -1;
+        packages[i].assignedTruckId = -1;
+        packages[i].pickedUp = 0;
+        packages[i].delivered = 0;
+    }
+
+    // --- Initialize trucks from shared memory initial state ---
+    for (int t = 0; t < D; t++) {
+        trucks[t].id = t;
+
+        trucks[t].x = mainShmPtr->truckPositions[t][0];
+        trucks[t].y = mainShmPtr->truckPositions[t][1];
+
+        trucks[t].onboardCount = 0;
+        trucks[t].assignedCount = 0;
+    }
+
+    // --- Set safe defaults in shared memory ---
+    for (int t = 0; t < D; t++) {
+        mainShmPtr->truckMovementInstructions[t] = MOVE_STAY;
+        mainShmPtr->pickUpCommands[t] = -1;
+        mainShmPtr->dropOffCommands[t] = -1;
+
+        // Clear auth strings initially
+        memset(mainShmPtr->authStrings[t], 0, TRUCK_MAX_CAP + 1);
+    }
+};
+
+int findPackageSlotById(int packageId)
+{
+    if (packageId < 0) return -1;
+
+    for (int i = 0; i < MAX_TOTAL_PACKAGES; i++) {
+        if (packages[i].packageId == packageId) {
+            return i;
+        }
+    }
+    return -1;
+}; // returns index or -1
 
 // ---- Input & IPC setup ----
-int readInputFile(const char *path);
-int setupSharedMemory();
-int setupMainMessageQueue();
-int setupSolverMessageQueues();
+int readInputFile(const char *path)
+{
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        fprintf(stderr, "Error opening %s: %s\n", path, strerror(errno));
+        return 1;
+    }
+
+    if (fscanf(fp, "%d %d %d %d %d %d %d %d",
+               &N, &D, &S, &T_last, &B,
+               &shmKey, &mainMqKey, &solverMqKeyBase) != 8)
+    {
+        fprintf(stderr, "Invalid input.txt format\n");
+        fclose(fp);
+        return 1;
+    }
+
+    fclose(fp);
+    return 0;
+};
+
+int setupSharedMemory()
+{
+    shmId = shmget((key_t)shmKey, sizeof(MainSharedMemory), 0);
+    if (shmId == -1) {
+        fprintf(stderr, "shmget failed: %s\n", strerror(errno));
+        return 1;
+    }
+
+    mainShmPtr = (MainSharedMemory *) shmat(shmId, NULL, 0);
+    if (mainShmPtr == (void *) -1) {
+        fprintf(stderr, "shmat failed: %s\n", strerror(errno));
+        return 1;
+    }
+
+    return 0;
+};
+
+int setupMainMessageQueue()
+{
+    mainMqId = msgget((key_t)mainMqKey, 0);
+    if (mainMqId == -1) {
+        fprintf(stderr, "msgget(mainMq) failed: %s\n", strerror(errno));
+        return 1;
+    }
+    return 0;
+};
+
+int setupSolverMessageQueues()
+{
+    for (int i = 0; i < S; i++) {
+        key_t k = (key_t)(solverMqKeyBase + i);
+
+        int mqid = msgget(k, 0);     // queues are already created by helper
+        if (mqid == -1) {
+            fprintf(stderr, "msgget(solver %d) failed: %s\n", i, strerror(errno));
+            return 1;
+        }
+
+        solverMqIds[i] = mqid;
+    }
+
+    return 0;
+};
 
 // ---- Turn loop helpers ----
-int readTurnChange(TurnChangeResponse *resp);
-void ingestNewPackagesIntoQueue(int newCount, int currentTurn);
-void syncTruckPositionsFromShared();
+int readTurnChange(TurnChangeResponse *resp)
+{
+    ssize_t r = msgrcv(mainMqId, resp, sizeof(TurnChangeResponse) - sizeof(long),
+                       2, 0);
+    if (r == -1) {
+        fprintf(stderr, "msgrcv TurnChangeResponse failed: %s\n", strerror(errno));
+        return 1;
+    }
+    return 0;
+};
+
+void ingestNewPackagesIntoQueue(int newCount, int currentTurn)
+{
+    for (int i = 0; i < newCount; i++) {
+
+        PackageRequest *pr = &mainShmPtr->newPackageRequests[i];
+        int pid = pr->packageId;
+
+        int idx = findPackageSlotById(pid);
+
+        if (idx == -1) {
+            // Find a free slot
+            for (int j = 0; j < MAX_TOTAL_PACKAGES; j++) {
+                if (packages[j].packageId == -1) {
+                    idx = j;
+                    break;
+                }
+            }
+        }
+
+        if (idx == -1) {
+            // should never happen in valid inputs
+            continue;
+        }
+
+        packages[idx].packageId = pid;
+        packages[idx].pickup_x  = pr->pickup_x;
+        packages[idx].pickup_y  = pr->pickup_y;
+        packages[idx].dropoff_x = pr->dropoff_x;
+        packages[idx].dropoff_y = pr->dropoff_y;
+        packages[idx].arrival_turn = pr->arrival_turn;
+        packages[idx].expiry_turn  = pr->expiry_turn;
+
+        packages[idx].assignedTruckId = -1;
+        packages[idx].pickedUp = 0;
+        packages[idx].delivered = 0;
+
+        enqueuePackage(&unassignedQueue, idx);
+    }
+};
+
+void syncTruckPositionsFromShared()
+{
+    for (int t = 0; t < D; t++) {
+        trucks[t].x = mainShmPtr->truckPositions[t][0];
+        trucks[t].y = mainShmPtr->truckPositions[t][1];
+    }
+};
 
 // ---- Assignment algorithm (simple version) ----
 // each truck picks one nearest unassigned package (greedy)
-void assignPackagesSimple(int currentTurn);
+void assignPackagesSimple(int currentTurn)
+{
+    (void) currentTurn;  // unused for now; kept for future optimizations
+
+    if (unassignedQueue.size == 0) {
+        return;
+    }
+
+    for (int t = 0; t < D; t++) {
+        TruckInfo *truck = &trucks[t];
+
+        // One-package-at-a-time rule
+        if (truck->onboardCount > 0 || truck->assignedCount > 0) {
+            continue;
+        }
+
+        int bestPkgIdx = -1;
+        int bestDist = 1000000000;  // effectively INF
+
+        int qSize = unassignedQueue.size;
+        int pos = unassignedQueue.front;
+
+        for (int k = 0; k < qSize; k++) {
+            int pkgIdx = unassignedQueue.indices[pos];
+            pos = (pos + 1) % MAX_TOTAL_PACKAGES;
+
+            if (pkgIdx < 0 || pkgIdx >= MAX_TOTAL_PACKAGES) {
+                continue;
+            }
+
+            PackageInfo *pkg = &packages[pkgIdx];
+
+            if (pkg->packageId == -1) {
+                continue;
+            }
+            if (pkg->delivered) {
+                continue;
+            }
+            if (pkg->assignedTruckId != -1) {
+                continue;
+            }
+
+            int dist = abs(truck->x - pkg->pickup_x) +
+                       abs(truck->y - pkg->pickup_y);
+
+            if (dist < bestDist) {
+                bestDist = dist;
+                bestPkgIdx = pkgIdx;
+            }
+        }
+
+        if (bestPkgIdx != -1) {
+            PackageInfo *chosen = &packages[bestPkgIdx];
+
+            chosen->assignedTruckId = t;
+
+            truck->assignedCount = 1;
+            truck->assignedPackageIds[0] = chosen->packageId;
+        }
+    }
+};
 
 // ---- Movement & decisions ----
 char computeNextMoveForTruck(int truckId, int currentTurn);
