@@ -418,9 +418,114 @@ void assignPackagesSimple(int currentTurn)
 };
 
 // ---- Movement & decisions ----
-char computeNextMoveForTruck(int truckId, int currentTurn);
-void decidePickDropForTruck(int truckId, int currentTurn);
-void writeDecisionsToShared(int currentTurn);
+static int getActivePackageIndexForTruck(int truckId)
+{
+    TruckInfo *truck = &trucks[truckId];
+
+    // Prefer onboard package
+    if (truck->onboardCount > 0) {
+        int pkgId = truck->onboardPackageIds[0];
+        int idx = findPackageSlotById(pkgId);
+        if (idx != -1) return idx;
+    }
+
+    // Otherwise, assigned but not yet picked
+    if (truck->assignedCount > 0) {
+        int pkgId = truck->assignedPackageIds[0];
+        int idx = findPackageSlotById(pkgId);
+        if (idx != -1) return idx;
+    }
+
+    return -1;
+};
+
+char computeNextMoveForTruck(int truckId, int currentTurn)
+{
+    (void) currentTurn;  // reserved for future use
+
+    TruckInfo *truck = &trucks[truckId];
+    int pkgIdx = getActivePackageIndexForTruck(truckId);
+
+    if (pkgIdx == -1) {
+        return MOVE_STAY;
+    }
+
+    PackageInfo *pkg = &packages[pkgIdx];
+
+    int target_x, target_y;
+
+    if (pkg->pickedUp && !pkg->delivered) {
+        target_x = pkg->dropoff_x;
+        target_y = pkg->dropoff_y;
+    } else {
+        target_x = pkg->pickup_x;
+        target_y = pkg->pickup_y;
+    }
+
+    if (truck->x < target_x) return MOVE_RIGHT;
+    if (truck->x > target_x) return MOVE_LEFT;
+    if (truck->y < target_y) return MOVE_DOWN;
+    if (truck->y > target_y) return MOVE_UP;
+
+    return MOVE_STAY;
+};
+
+void decidePickDropForTruck(int truckId, int currentTurn)
+{
+    (void) currentTurn;
+
+    TruckInfo *truck = &trucks[truckId];
+
+    mainShmPtr->pickUpCommands[truckId] = -1;
+    mainShmPtr->dropOffCommands[truckId] = -1;
+
+    int pkgIdx = getActivePackageIndexForTruck(truckId);
+    if (pkgIdx == -1) {
+        return;
+    }
+
+    PackageInfo *pkg = &packages[pkgIdx];
+
+    // Pickup case
+    if (!pkg->pickedUp && !pkg->delivered &&
+        truck->x == pkg->pickup_x && truck->y == pkg->pickup_y)
+    {
+        mainShmPtr->pickUpCommands[truckId] = pkg->packageId;
+
+        pkg->pickedUp = 1;
+        pkg->assignedTruckId = truckId;
+
+        truck->onboardCount = 1;
+        truck->onboardPackageIds[0] = pkg->packageId;
+        truck->assignedCount = 0;
+
+        return;
+    }
+
+    // Dropoff case
+    if (pkg->pickedUp && !pkg->delivered &&
+        truck->x == pkg->dropoff_x && truck->y == pkg->dropoff_y)
+    {
+        mainShmPtr->dropOffCommands[truckId] = pkg->packageId;
+
+        pkg->delivered = 1;
+        pkg->assignedTruckId = -1;
+
+        truck->onboardCount = 0;
+        if (truck->onboardCount > 0) {
+            truck->onboardPackageIds[0] = -1;
+        }
+    }
+};
+void writeDecisionsToShared(int currentTurn)
+{
+    for (int t = 0; t < D; t++) {
+        decidePickDropForTruck(t, currentTurn);
+
+        char move = computeNextMoveForTruck(t, currentTurn);
+        mainShmPtr->truckMovementInstructions[t] = move;
+    }
+};
 
 // ---- Authorization guessing ----
 // for now: naive loop guessing a fixed dummy string of proper length
