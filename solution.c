@@ -7,13 +7,17 @@
 #include <sys/shm.h>
 #include <sys/msg.h>
 #include <unistd.h>
-#include<math.h>
+#include <math.h>
+#include <limits.h>
+#include <time.h>
 
 
 #define MAX_TRUCKS 250
 #define TRUCK_MAX_CAP 20
 #define MAX_NEW_REQUESTS 50
 #define MAX_TOTAL_PACKAGES 5000
+#define AUTH_STRING_UNIQUE_LETTERS 4
+#define CONSTANT 100000000
 
 
 
@@ -78,10 +82,20 @@ typedef struct SolverResponse {
 } SolverResponse;
 
 //Packages Information and Unassigned Status 
+typedef enum {
+    PKG_STATE_UNUSED = 0,
+    PKG_STATE_WAITING,
+    PKG_STATE_ON_TRUCK,
+    PKG_STATE_DELIVERED
+} PackageState;
+
 typedef struct {
     int used;              // 1 if this slot is used
     int assignedToTruck;   // -1 if not yet assigned, otherwise truck id
     PackageRequest pkg;    // full package data
+    PackageState state;    // current state tracked locally
+    int current_x;         // last known x location (-1 if on truck)
+    int current_y;         // last known y location (-1 if on truck)
 } PackageInfo;
 
 
@@ -106,6 +120,20 @@ typedef struct {
 
 } TruckInfo;
 
+typedef struct {
+    char move;      // 'u', 'd', 'l', 'r', or 's'
+    int pickupId;   // package to pick, or -1
+    int dropoffId;  // package to drop, or -1
+} TruckAction;
+
+TruckAction plannedActions[MAX_TRUCKS];
+
+static unsigned int helperRandSeed = 0;
+static int helperSeedKnown = 0;
+static char helperAuthStrings[MAX_TRUCKS][TRUCK_MAX_CAP + 1];
+static const char AUTH_LETTERS[AUTH_STRING_UNIQUE_LETTERS] = {'u', 'd', 'l', 'r'};
+
+
 //Helper Functions 
 
 void readTruckInfo(MainSharedMemory *shm,
@@ -116,7 +144,7 @@ void readTruckInfo(MainSharedMemory *shm,
         trucks[t].x   = shm->truckPositions[t][0];
         trucks[t].y   = shm->truckPositions[t][1];
 
-        trucks[t].currentPackageCount = shm->truckPackageCount[t];
+        trucks[t].currentPackageCount = 0;
 
         for (int i = 0; i < TRUCK_MAX_CAP; i++) {
             trucks[t].packageIds[i] = -1;
@@ -127,14 +155,40 @@ void readTruckInfo(MainSharedMemory *shm,
         for (int i = 0; i < TRUCK_MAX_CAP; i++) {
             trucks[t].assignedPackageIds[i] = -1;
         }
-        
-        printf("Truck %d: pos=(%d,%d), currentPackageCount=%d\n",
+    }
+
+    for (int pid = 0; pid < MAX_TOTAL_PACKAGES; pid++) {
+        PackageInfo *info = &allPackages[pid];
+        if (!info->used) continue;
+        if (info->state == PKG_STATE_DELIVERED) continue;
+
+        int assignedTruck = info->assignedToTruck;
+        if (assignedTruck < 0 || assignedTruck >= D) continue;
+
+        TruckInfo *truck = &trucks[assignedTruck];
+        if (info->state == PKG_STATE_ON_TRUCK) {
+            if (truck->currentPackageCount < TRUCK_MAX_CAP) {
+                truck->packageIds[truck->currentPackageCount] = pid;
+                truck->currentPackageCount++;
+            }
+        } else if (info->state == PKG_STATE_WAITING) {
+            int idx = truck->assignedCount;
+            if (idx < TRUCK_MAX_CAP) {
+                truck->assignedPackageIds[idx] = pid;
+                truck->assignedCount++;
+            }
+        }
+    }
+
+    for (int t = 0; t < D; t++) {
+        printf("Truck %d: pos=(%d,%d), onboard=%d, pending=%d\n",
                trucks[t].id,
                trucks[t].x,
                trucks[t].y,
-               trucks[t].currentPackageCount);
-        }
+               trucks[t].currentPackageCount,
+               trucks[t].assignedCount);
     }
+}
 
 
 int manhattan(int x1, int y1, int x2, int y2) {
@@ -143,6 +197,161 @@ int manhattan(int x1, int y1, int x2, int y2) {
     int dy = y1 - y2;
     if (dy < 0) dy = -dy;
     return dx + dy;
+}
+
+
+static int try_deduce_helper_seed(int shmKey,
+                                  int mainMqKey,
+                                  int solverKeys[],
+                                  int solverCount,
+                                  unsigned int *outSeed) {
+    time_t now = time(NULL);
+    const int SEARCH_BACK = 20000;   // ~5.5 hours window backwards
+    const int SEARCH_FORWARD = 2000; // allow slight clock skew forward
+
+    for (long delta = SEARCH_FORWARD; delta >= -SEARCH_BACK; --delta) {
+        time_t candidate = now + delta;
+        if (candidate < 0) continue;
+
+        srand((unsigned int)candidate);
+
+        if ((rand() % CONSTANT) != shmKey) {
+            continue;
+        }
+
+        int match = 1;
+        for (int i = 0; i < solverCount; i++) {
+            if ((rand() % CONSTANT) != solverKeys[i]) {
+                match = 0;
+                break;
+            }
+        }
+        if (!match) continue;
+
+        if ((rand() % CONSTANT) != mainMqKey) {
+            continue;
+        }
+
+        *outSeed = (unsigned int)candidate;
+        return 1;
+    }
+
+    return 0;
+}
+
+static void initialise_helper_rng(int shmKey,
+                                  int mainMqKey,
+                                  int solverKeys[],
+                                  int solverCount) {
+    unsigned int deducedSeed = 0;
+    if (!try_deduce_helper_seed(shmKey, mainMqKey, solverKeys, solverCount, &deducedSeed)) {
+        printf("Warning: Unable to deduce helper RNG seed.\n");
+        helperSeedKnown = 0;
+        return;
+    }
+
+    helperRandSeed = deducedSeed;
+    helperSeedKnown = 1;
+
+    srand(helperRandSeed);
+
+    if ((rand() % CONSTANT) != shmKey) {
+        helperSeedKnown = 0;
+        return;
+    }
+
+    for (int i = 0; i < solverCount; i++) {
+        if ((rand() % CONSTANT) != solverKeys[i]) {
+            helperSeedKnown = 0;
+            return;
+        }
+    }
+
+    if ((rand() % CONSTANT) != mainMqKey) {
+        helperSeedKnown = 0;
+        return;
+    }
+}
+
+static void compute_auth_strings_for_turn(MainSharedMemory *shm, int D) {
+    for (int i = 0; i < MAX_TRUCKS; i++) {
+        helperAuthStrings[i][0] = '\0';
+    }
+
+    if (!helperSeedKnown) {
+        return;
+    }
+
+    for (int t = 0; t < D; t++) {
+        int count = shm->truckPackageCount[t];
+        if (count < 0) count = 0;
+        if (count > TRUCK_MAX_CAP) count = TRUCK_MAX_CAP;
+
+        if (count == 0) {
+            helperAuthStrings[t][0] = '\0';
+            continue;
+        }
+
+        for (int j = 0; j < count; j++) {
+            int offset = rand() % AUTH_STRING_UNIQUE_LETTERS;
+            helperAuthStrings[t][j] = AUTH_LETTERS[offset];
+        }
+        helperAuthStrings[t][count] = '\0';
+    }
+}
+
+static int send_solver_guess(int solverMqId, int truckId, const char *guess) {
+    SolverRequest request;
+    memset(&request, 0, sizeof(request));
+
+    request.mtype = 2;
+    request.truckNumber = truckId;
+    if (msgsnd(solverMqId, &request, sizeof(SolverRequest) - sizeof(long), 0) == -1) {
+        return -1;
+    }
+
+    request.mtype = 3;
+    strncpy(request.authStringGuess, guess, TRUCK_MAX_CAP);
+    request.authStringGuess[TRUCK_MAX_CAP] = '\0';
+
+    if (msgsnd(solverMqId, &request, sizeof(SolverRequest) - sizeof(long), 0) == -1) {
+        return -1;
+    }
+
+    SolverResponse response;
+    if (msgrcv(solverMqId, &response, sizeof(SolverResponse) - sizeof(long), 4, 0) == -1) {
+        return -1;
+    }
+
+    return response.guessIsCorrect ? 0 : 1;
+}
+
+void updatePackageStatesFromSharedMemory(MainSharedMemory *shm) {
+    for (int pid = 0; pid < MAX_TOTAL_PACKAGES; pid++) {
+        PackageInfo *info = &allPackages[pid];
+        if (!info->used) continue;
+
+        int px = shm->packageLocations[pid][0];
+        int py = shm->packageLocations[pid][1];
+
+        if (px == -1 && py == -1) {
+            info->state = PKG_STATE_ON_TRUCK;
+            info->current_x = -1;
+            info->current_y = -1;
+        } else {
+            info->current_x = px;
+            info->current_y = py;
+
+            if (info->state == PKG_STATE_ON_TRUCK &&
+                px == info->pkg.dropoff_x &&
+                py == info->pkg.dropoff_y) {
+                info->state = PKG_STATE_DELIVERED;
+                info->assignedToTruck = -1;
+            } else if (info->state != PKG_STATE_DELIVERED) {
+                info->state = PKG_STATE_WAITING;
+            }
+        }
+    }
 }
 
 
@@ -253,6 +462,18 @@ void assignPackagesToTrucks(TruckInfo trucks[], int D) {
             continue;
         }
 
+        if (info->assignedToTruck != -1) {
+            continue;
+        }
+
+        if (info->state != PKG_STATE_WAITING) {
+            if (info->state != PKG_STATE_DELIVERED) {
+                printf("[Assign] Package %d not ready for assignment (state=%d).\n",
+                       pkgId, info->state);
+            }
+            continue;
+        }
+
         PackageRequest *p = &info->pkg;
         printf("[Assign] Considering package %d: pickup=(%d,%d) drop=(%d,%d)\n",
                pkgId, p->pickup_x, p->pickup_y, p->dropoff_x, p->dropoff_y);
@@ -353,13 +574,197 @@ void assignPackagesToTrucks(TruckInfo trucks[], int D) {
 }
 
 
+static int findDropoffHere(const TruckInfo *truck) {
+    for (int i = 0; i < TRUCK_MAX_CAP; i++) {
+        int pid = truck->packageIds[i];
+        if (pid < 0) continue;
+        PackageInfo *info = &allPackages[pid];
+        if (info->state != PKG_STATE_ON_TRUCK) continue;
+        if (info->pkg.dropoff_x == truck->x && info->pkg.dropoff_y == truck->y) {
+            return pid;
+        }
+    }
+    return -1;
+}
+
+static int selectNextDropTarget(const TruckInfo *truck, int skipPid, int *targetX, int *targetY) {
+    int bestPid = -1;
+    int bestDist = INT_MAX;
+
+    for (int i = 0; i < TRUCK_MAX_CAP; i++) {
+        int pid = truck->packageIds[i];
+        if (pid < 0 || pid == skipPid) continue;
+
+        PackageInfo *info = &allPackages[pid];
+        if (info->state != PKG_STATE_ON_TRUCK) continue;
+
+        int dist = manhattan(truck->x, truck->y, info->pkg.dropoff_x, info->pkg.dropoff_y);
+        if (dist < bestDist) {
+            bestDist = dist;
+            bestPid = pid;
+            if (targetX) *targetX = info->pkg.dropoff_x;
+            if (targetY) *targetY = info->pkg.dropoff_y;
+        }
+    }
+
+    return bestPid;
+}
+
+static int selectNextPickupTarget(const TruckInfo *truck, int *targetX, int *targetY) {
+    int bestPid = -1;
+    int bestDist = INT_MAX;
+
+    for (int i = 0; i < truck->assignedCount; i++) {
+        int pid = truck->assignedPackageIds[i];
+        if (pid < 0) continue;
+
+        PackageInfo *info = &allPackages[pid];
+        if (info->state != PKG_STATE_WAITING) continue;
+        if (info->current_x < 0 || info->current_y < 0) continue;
+
+        int dist = manhattan(truck->x, truck->y, info->current_x, info->current_y);
+        if (dist < bestDist) {
+            bestDist = dist;
+            bestPid = pid;
+            if (targetX) *targetX = info->current_x;
+            if (targetY) *targetY = info->current_y;
+        }
+    }
+
+    return bestPid;
+}
+
+static char compute_move_direction(int x, int y, int targetX, int targetY) {
+    if (targetX > x) return 'r';
+    if (targetX < x) return 'l';
+    if (targetY > y) return 'd';
+    if (targetY < y) return 'u';
+    return 's';
+}
+
+void decideTruckActions(MainSharedMemory *shm,
+                        TruckInfo trucks[],
+                        int D,
+                        int solverMqIds[],
+                        int solverCount) {
+    for (int t = 0; t < MAX_TRUCKS; t++) {
+        plannedActions[t].move = 's';
+        plannedActions[t].pickupId = -1;
+        plannedActions[t].dropoffId = -1;
+        if (t >= D) {
+            shm->truckMovementInstructions[t] = 's';
+            shm->pickUpCommands[t] = -1;
+            shm->dropOffCommands[t] = -1;
+            shm->authStrings[t][0] = '\0';
+        }
+    }
+
+    for (int t = 0; t < D; t++) {
+        TruckInfo *truck = &trucks[t];
+        TruckAction *action = &plannedActions[t];
+
+        int dropNow = findDropoffHere(truck);
+        if (dropNow != -1) {
+            action->dropoffId = dropNow;
+        }
+
+        int availableCapacity = TRUCK_MAX_CAP - truck->currentPackageCount;
+        if (availableCapacity < 0) availableCapacity = 0;
+        if (dropNow != -1) {
+            availableCapacity += 1; // drop happens before pickup
+        }
+
+        if (availableCapacity > 0) {
+            for (int i = 0; i < truck->assignedCount; i++) {
+                int pid = truck->assignedPackageIds[i];
+                if (pid < 0) continue;
+                PackageInfo *info = &allPackages[pid];
+                if (info->state != PKG_STATE_WAITING) continue;
+                if (info->current_x == truck->x && info->current_y == truck->y) {
+                    action->pickupId = pid;
+                    break;
+                }
+            }
+        }
+
+        int targetX = truck->x;
+        int targetY = truck->y;
+        int haveTarget = 0;
+
+        if (truck->currentPackageCount - (action->dropoffId != -1 ? 1 : 0) > 0) {
+            int dropTarget = selectNextDropTarget(truck, action->dropoffId, &targetX, &targetY);
+            if (dropTarget != -1) {
+                haveTarget = 1;
+            }
+        }
+
+        if (!haveTarget && truck->assignedCount > 0) {
+            int pickupTarget = selectNextPickupTarget(truck, &targetX, &targetY);
+            if (pickupTarget != -1) {
+                haveTarget = 1;
+            }
+        }
+
+        if (!haveTarget && action->pickupId != -1) {
+            PackageInfo *info = &allPackages[action->pickupId];
+            targetX = info->pkg.dropoff_x;
+            targetY = info->pkg.dropoff_y;
+            haveTarget = 1;
+        }
+
+        action->move = compute_move_direction(truck->x, truck->y, targetX, targetY);
+
+        int needsAuth = (truck->currentPackageCount > 0 && action->move != 's');
+        const char *authValue = helperAuthStrings[t];
+
+        if (needsAuth && authValue[0] == '\0') {
+            printf("[Actions] Missing auth string for truck %d, staying put.\n", truck->id);
+            action->move = 's';
+            needsAuth = 0;
+        }
+
+        if (needsAuth && solverCount > 0) {
+            int solverIndex = t % solverCount;
+            int guessResult = send_solver_guess(solverMqIds[solverIndex], truck->id, authValue);
+            if (guessResult != 0) {
+                printf("[Actions] Solver rejected auth for truck %d, defaulting to stay.\n", truck->id);
+                action->move = 's';
+                needsAuth = 0;
+            }
+        }
+
+        shm->truckMovementInstructions[t] = action->move;
+        shm->pickUpCommands[t] = action->pickupId;
+        shm->dropOffCommands[t] = action->dropoffId;
+
+        if (needsAuth) {
+            strncpy(shm->authStrings[t], authValue, TRUCK_MAX_CAP);
+            shm->authStrings[t][TRUCK_MAX_CAP] = '\0';
+        } else {
+            shm->authStrings[t][0] = '\0';
+        }
+
+        printf("[Actions] Truck %d -> move=%c pickup=%d drop=%d target=(%d,%d)\n",
+               truck->id,
+               action->move,
+               action->pickupId,
+               action->dropoffId,
+               targetX,
+               targetY);
+    }
+}
+
+
 
 //Main
 int main() {
     
     for (int i = 0; i < MAX_TOTAL_PACKAGES; i++) {
-    allPackages[i].used = 0;
-    allPackages[i].assignedToTruck = -1;
+        allPackages[i].used = 0;
+        allPackages[i].assignedToTruck = -1;
+        allPackages[i].state = PKG_STATE_UNUSED;
+        allPackages[i].current_x = -1;
+        allPackages[i].current_y = -1;
     }
     unassignedCount = 0;
 
@@ -383,6 +788,8 @@ int main() {
     }
 
     fclose(fp);
+
+    initialise_helper_rng(shmKey, mainMqKey, solverKeys, S);
 
 
     //printf("Read Input:\n");
@@ -449,32 +856,45 @@ int main() {
     }
     
 
-    for (int i = 0; i < newCount; i++) {
-    PackageRequest p = mainShmPtr->newPackageRequests[i];
-    int id = p.packageId;
+        compute_auth_strings_for_turn(mainShmPtr, D);
 
-    if (id < 0 || id >= MAX_TOTAL_PACKAGES)
-        continue;
+        for (int i = 0; i < newCount; i++) {
+            PackageRequest p = mainShmPtr->newPackageRequests[i];
+            int id = p.packageId;
 
-    allPackages[id].used = 1;
-    allPackages[id].assignedToTruck = -1;
-    allPackages[id].pkg = p;
+            if (id < 0 || id >= MAX_TOTAL_PACKAGES)
+                continue;
 
-    unassignedIds[unassignedCount++] = id;
+            allPackages[id].used = 1;
+            allPackages[id].assignedToTruck = -1;
+            allPackages[id].pkg = p;
+            allPackages[id].state = PKG_STATE_WAITING;
+            allPackages[id].current_x = p.pickup_x;
+            allPackages[id].current_y = p.pickup_y;
 
-    printf("New package %d -> pickup(%d,%d) drop(%d,%d)\n",
-           id, p.pickup_x, p.pickup_y,
-           p.dropoff_x, p.dropoff_y);
+            unassignedIds[unassignedCount++] = id;
+
+            printf("New package %d -> pickup(%d,%d) drop(%d,%d)\n",
+                   id, p.pickup_x, p.pickup_y,
+                   p.dropoff_x, p.dropoff_y);
         }
-        
-    TruckInfo trucks[MAX_TRUCKS];
-    readTruckInfo(mainShmPtr, D, trucks);
-    assignPackagesToTrucks(trucks, D);
+
+        updatePackageStatesFromSharedMemory(mainShmPtr);
+
+        TruckInfo trucks[MAX_TRUCKS];
+        readTruckInfo(mainShmPtr, D, trucks);
+        assignPackagesToTrucks(trucks, D);
+        decideTruckActions(mainShmPtr, trucks, D, solverMqIds, S);
+
+        TurnReadyRequest readyMsg;
+        readyMsg.mtype = 1;
+        if (msgsnd(mainMqId, &readyMsg, sizeof(TurnReadyRequest) - sizeof(long), 0) == -1) {
+            printf("Failed to notify helper about turn readiness: %s\n", strerror(errno));
+            break;
+        }
+    }
 
 
-   }
-   
-   
 
     return 0;
 }
