@@ -355,67 +355,268 @@ void syncTruckPositionsFromShared()
 
 // ---- Assignment algorithm (simple version) ----
 // each truck picks one nearest unassigned package (greedy)
-void assignPackagesSimple(int currentTurn)
-{
-    (void) currentTurn;  // unused for now; kept for future optimizations
+// ===== Assignment heuristic weights =====
+static const double W_DIST = 1.0;
+static const double W_URG  = 1.0;   // only negative slack penalized
+static const double W_DIR  = 0.5;
+static const double W_LOAD = 0.3;
+static const double TINY   = 1e-3;
 
-    if (unassignedQueue.size == 0) {
-        return;
+static int manhattan(int x1, int y1, int x2, int y2)
+{
+    int dx = x1 - x2;
+    if (dx < 0) dx = -dx;
+    int dy = y1 - y2;
+    if (dy < 0) dy = -dy;
+    return dx + dy;
+};
+
+static void estimateTruckRouteTail(int t, int currentTurn,
+                                   int *tailX, int *tailY, int *tailTurn,
+                                   int *loadOut)
+{
+    int x = trucks[t].x;
+    int y = trucks[t].y;
+
+    int startTurn = currentTurn;
+    int toll = mainShmPtr->truckTurnsInToll[t];
+    if (toll > 0) {
+        startTurn += toll;
     }
 
-    for (int t = 0; t < D; t++) {
-        TruckInfo *truck = &trucks[t];
+    int time = startTurn;
+    int load = 0;
 
-        // One-package-at-a-time rule
-        if (truck->onboardCount > 0 || truck->assignedCount > 0) {
+    // Onboard packages: only need to deliver
+    for (int i = 0; i < trucks[t].onboardCount; i++) {
+        int idx = trucks[t].onboardPackageIds[i];
+        if (idx < 0 || idx >= MAX_TOTAL_PACKAGES) continue;
+        if (packages[idx].delivered) continue;
+
+        int dx = packages[idx].dropoff_x;
+        int dy = packages[idx].dropoff_y;
+
+        time += manhattan(x, y, dx, dy);
+        x = dx;
+        y = dy;
+        load++;
+    }
+
+    // Assigned packages: pickup (if not yet) then drop
+    for (int i = 0; i < trucks[t].assignedCount; i++) {
+        int idx = trucks[t].assignedPackageIds[i];
+        if (idx < 0 || idx >= MAX_TOTAL_PACKAGES) continue;
+        if (packages[idx].delivered) continue;
+
+        int px = packages[idx].pickup_x;
+        int py = packages[idx].pickup_y;
+        int dx = packages[idx].dropoff_x;
+        int dy = packages[idx].dropoff_y;
+
+        if (!packages[idx].pickedUp) {
+            time += manhattan(x, y, px, py);
+            x = px;
+            y = py;
+        }
+        time += manhattan(x, y, dx, dy);
+        x = dx;
+        y = dy;
+        load++;
+    }
+
+    *tailX = x;
+    *tailY = y;
+    *tailTurn = time;
+    *loadOut = load;
+};
+
+static int comparePackageCandidates(const void *a, const void *b)
+{
+    int idxA = *(const int *)a;
+    int idxB = *(const int *)b;
+
+    const PackageInfo *pa = &packages[idxA];
+    const PackageInfo *pb = &packages[idxB];
+
+    // 1) expiry_turn ascending
+    if (pa->expiry_turn != pb->expiry_turn)
+        return (pa->expiry_turn < pb->expiry_turn) ? -1 : 1;
+
+    // 2) arrival_turn ascending
+    if (pa->arrival_turn != pb->arrival_turn)
+        return (pa->arrival_turn < pb->arrival_turn) ? -1 : 1;
+
+    // 3) longer pickup->dropoff distance first
+    int da = manhattan(pa->pickup_x, pa->pickup_y,
+                       pa->dropoff_x, pa->dropoff_y);
+    int db = manhattan(pb->pickup_x, pb->pickup_y,
+                       pb->dropoff_x, pb->dropoff_y);
+
+    if (da != db)
+        return (da > db) ? -1 : 1;
+
+    // 4) packageId ascending for determinism
+    if (pa->packageId != pb->packageId)
+        return (pa->packageId < pb->packageId) ? -1 : 1;
+
+    return 0;
+}
+
+
+void assignPackagesSimple(int currentTurn)
+{
+    int candidates[MAX_TOTAL_PACKAGES];
+    int candCount = 0;
+
+    // 1) Drain unassignedQueue into candidates (filtering out already-assigned/delivered)
+    while (!isPackageQueueEmpty(&unassignedQueue)) {
+        int idx = dequeuePackage(&unassignedQueue);
+        if (idx < 0 || idx >= MAX_TOTAL_PACKAGES) continue;
+
+        if (packages[idx].delivered) {
+            continue;
+        }
+        if (packages[idx].assignedTruckId != -1) {
             continue;
         }
 
-        int bestPkgIdx = -1;
-        int bestDist = 1000000000;  // effectively INF
+        candidates[candCount++] = idx;
+    }
 
-        int qSize = unassignedQueue.size;
-        int pos = unassignedQueue.front;
+    if (candCount == 0) {
+        return;
+    }
 
-        for (int k = 0; k < qSize; k++) {
-            int pkgIdx = unassignedQueue.indices[pos];
-            pos = (pos + 1) % MAX_TOTAL_PACKAGES;
+    // 2) Sort candidates by urgency and other criteria
+    qsort(candidates, candCount, sizeof(int), comparePackageCandidates);
 
-            if (pkgIdx < 0 || pkgIdx >= MAX_TOTAL_PACKAGES) {
+    // 3) Precompute route tails and loads for each truck
+    int routeTailX[MAX_TRUCKS];
+    int routeTailY[MAX_TRUCKS];
+    int routeTailTurn[MAX_TRUCKS];
+    int truckCurrentLoad[MAX_TRUCKS];
+
+    for (int t = 0; t < D; t++) {
+        int load = 0;
+        int tailX, tailY, tailTurn;
+        estimateTruckRouteTail(t, currentTurn, &tailX, &tailY, &tailTurn, &load);
+
+        routeTailX[t] = tailX;
+        routeTailY[t] = tailY;
+        routeTailTurn[t] = tailTurn;
+        truckCurrentLoad[t] = load;
+    }
+
+    // 4) For each package: choose best truck with remaining capacity
+    for (int c = 0; c < candCount; c++) {
+        int pIdx = candidates[c];
+        PackageInfo *p = &packages[pIdx];
+
+        int bestTruck = -1;
+        double bestScore = 0.0;
+        int first = 1;
+
+        int px = p->pickup_x;
+        int py = p->pickup_y;
+        int dx = p->dropoff_x;
+        int dy = p->dropoff_y;
+
+        for (int t = 0; t < D; t++) {
+            if (truckCurrentLoad[t] >= 5) {
                 continue;
             }
 
-            PackageInfo *pkg = &packages[pkgIdx];
+            int tailX = routeTailX[t];
+            int tailY = routeTailY[t];
+            int tailTurn = routeTailTurn[t];
 
-            if (pkg->packageId == -1) {
-                continue;
-            }
-            if (pkg->delivered) {
-                continue;
-            }
-            if (pkg->assignedTruckId != -1) {
-                continue;
+            int toPickup = manhattan(tailX, tailY, px, py);
+            int pickupToDrop = manhattan(px, py, dx, dy);
+            int etaDelivery = tailTurn + toPickup + pickupToDrop;
+            int slack = p->expiry_turn - etaDelivery;
+
+            // Distance / detour cost
+            int dist_cost = toPickup + pickupToDrop;
+
+            // Urgency: only penalize if cannot meet expiry
+            double urgency_cost = 0.0;
+            if (slack < 0) {
+                urgency_cost = 1000000.0 + (double)(-slack);
             }
 
-            int dist = abs(truck->x - pkg->pickup_x) +
-                       abs(truck->y - pkg->pickup_y);
+            // Direction cost
+            int dx_route = routeTailX[t] - trucks[t].x;
+            int dy_route = routeTailY[t] - trucks[t].y;
+            int dx_new   = px - trucks[t].x;
+            int dy_new   = py - trucks[t].y;
 
-            if (dist < bestDist) {
-                bestDist = dist;
-                bestPkgIdx = pkgIdx;
+            int sameX = (dx_route == 0 || dx_new == 0 ||
+                         (dx_route > 0 && dx_new > 0) ||
+                         (dx_route < 0 && dx_new < 0));
+            int sameY = (dy_route == 0 || dy_new == 0 ||
+                         (dy_route > 0 && dy_new > 0) ||
+                         (dy_route < 0 && dy_new < 0));
+
+            int direction_cost = 0;
+            if (sameX && sameY) {
+                direction_cost = 0;
+            } else if (sameX || sameY) {
+                direction_cost = 1;
+            } else {
+                direction_cost = 2;
+            }
+
+            int load_cost = truckCurrentLoad[t];
+
+            double score = 0.0;
+            score += W_DIST * (double)dist_cost;
+            score += W_URG  * urgency_cost;
+            score += W_DIR  * (double)direction_cost;
+            score += W_LOAD * (double)load_cost;
+            score += TINY   * (double)t;  // tie-break by truck index
+
+            if (first || score < bestScore) {
+                bestScore = score;
+                bestTruck = t;
+                first = 0;
             }
         }
 
-        if (bestPkgIdx != -1) {
-            PackageInfo *chosen = &packages[bestPkgIdx];
+        // Assign if we found any truck with capacity
+        if (bestTruck != -1) {
+            int t = bestTruck;
 
-            chosen->assignedTruckId = t;
+            p->assignedTruckId = t;
+            p->pickedUp = 0;
+            p->delivered = 0;
 
-            truck->assignedCount = 1;
-            truck->assignedPackageIds[0] = chosen->packageId;
+            int pos = trucks[t].assignedCount;
+            if (pos < TRUCK_MAX_CAP) {
+                trucks[t].assignedPackageIds[pos] = pIdx;
+                trucks[t].assignedCount++;
+            }
+
+            truckCurrentLoad[t]++;
+
+            int toPickup = manhattan(routeTailX[t], routeTailY[t], px, py);
+            int pickupToDrop = manhattan(px, py, dx, dy);
+
+            routeTailTurn[t] += toPickup + pickupToDrop;
+            routeTailX[t] = dx;
+            routeTailY[t] = dy;
+        }
+    }
+
+    // 5) Re-enqueue packages that remain unassigned (trucks all full)
+    for (int c = 0; c < candCount; c++) {
+        int pIdx = candidates[c];
+        if (packages[pIdx].assignedTruckId == -1 &&
+            !packages[pIdx].delivered) {
+            enqueuePackage(&unassignedQueue, pIdx);
         }
     }
 };
+
 
 // ---- Movement & decisions ----
 static int getActivePackageIndexForTruck(int truckId)
